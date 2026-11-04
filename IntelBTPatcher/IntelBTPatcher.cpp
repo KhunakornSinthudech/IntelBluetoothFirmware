@@ -11,6 +11,7 @@
 
 #include "IntelBTPatcher.hpp"
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include <sys/sysctl.h>
 
 static CIntelBTPatcher ibtPatcher;
 static CIntelBTPatcher *callbackIBTPatcher = nullptr;
@@ -72,10 +73,39 @@ bool CIntelBTPatcher::_randomAddressInit = false;
 
 static bool avrcpPlayingFilter = false;
 
+// Counters readable with: sysctl debug.ibtp
+static uint32_t ibtpFilterOn = 0, ibtpPipe = 0, ibtpCalls = 0, ibtpBmd = 0,
+                ibtpOther = 0, ibtpMatch = 0, ibtpRewrite = 0;
+SYSCTL_NODE(_debug, OID_AUTO, ibtp, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "IntelBTPatcher");
+SYSCTL_UINT(_debug_ibtp, OID_AUTO, filter,  CTLFLAG_RD | CTLFLAG_LOCKED, &ibtpFilterOn, 0, "");
+SYSCTL_UINT(_debug_ibtp, OID_AUTO, pipe,    CTLFLAG_RD | CTLFLAG_LOCKED, &ibtpPipe, 0, "");
+SYSCTL_UINT(_debug_ibtp, OID_AUTO, calls,   CTLFLAG_RD | CTLFLAG_LOCKED, &ibtpCalls, 0, "");
+SYSCTL_UINT(_debug_ibtp, OID_AUTO, bmd,     CTLFLAG_RD | CTLFLAG_LOCKED, &ibtpBmd, 0, "");
+SYSCTL_UINT(_debug_ibtp, OID_AUTO, other,   CTLFLAG_RD | CTLFLAG_LOCKED, &ibtpOther, 0, "");
+SYSCTL_UINT(_debug_ibtp, OID_AUTO, match,   CTLFLAG_RD | CTLFLAG_LOCKED, &ibtpMatch, 0, "");
+SYSCTL_UINT(_debug_ibtp, OID_AUTO, rewrite, CTLFLAG_RD | CTLFLAG_LOCKED, &ibtpRewrite, 0, "");
+
+static bool ibtpSysctlDone = false;
+static void ibtpRegisterSysctl()
+{
+    if (ibtpSysctlDone)
+        return;
+    ibtpSysctlDone = true;
+    sysctl_register_oid(&sysctl__debug_ibtp);
+    sysctl_register_oid(&sysctl__debug_ibtp_filter);
+    sysctl_register_oid(&sysctl__debug_ibtp_pipe);
+    sysctl_register_oid(&sysctl__debug_ibtp_calls);
+    sysctl_register_oid(&sysctl__debug_ibtp_bmd);
+    sysctl_register_oid(&sysctl__debug_ibtp_other);
+    sysctl_register_oid(&sysctl__debug_ibtp_match);
+    sysctl_register_oid(&sysctl__debug_ibtp_rewrite);
+}
+
 bool CIntelBTPatcher::init()
 {
     if (checkKernelArgument("-ibtnoplaying")) {
         avrcpPlayingFilter = true;
+        ibtpFilterOn = 1;
         SYSLOG(DRV_NAME, "AVRCP PLAYING filter enabled");
     }
     DBGLOG(DRV_NAME, "%s", __PRETTY_FUNCTION__);
@@ -347,7 +377,9 @@ static void filterAvrcpPlaying(void *pipe, IOMemoryDescriptor *buf, uint32_t len
 {
     if (!avrcpPlayingFilter || pipe != btBulkOutPipe || !buf)
         return;
+    ibtpCalls++;
     IOBufferMemoryDescriptor *bmd = OSDynamicCast(IOBufferMemoryDescriptor, buf);
+    if (bmd) ibtpBmd++; else ibtpOther++;
     if (!loggedBufClass) {
         loggedBufClass = true;
         SYSLOG(DRV_NAME, "BT bulk-out buffer class: %s", buf->getMetaClass()->getClassName());
@@ -375,9 +407,13 @@ static void filterAvrcpPlaying(void *pipe, IOMemoryDescriptor *buf, uint32_t len
     else if (pdu == 0x30 && ctype == 0x0c && len == 8 + 22 &&
              a[11] == 0x00 && a[12] == 0x09)
         off = 8 + 21;                       // GetPlayStatus: len(4) pos(4) status(1)
-    if (!off || p[off] != 0x01)
+    if (!off)
+        return;
+    ibtpMatch++;
+    if (p[off] != 0x01)
         return;
     p[off] = 0x02;
+    ibtpRewrite++;
     if (avrcpRewriteCount++ < 20)
         SYSLOG(DRV_NAME, "AVRCP PlayStatus PLAYING -> PAUSED (pdu 0x%02x)", pdu);
 }
@@ -405,12 +441,15 @@ void CIntelBTPatcher::captureIntelInterruptPipe(void *that, StandardUSB::Endpoin
         return;
     const StandardUSB::DeviceDescriptor *deviceDescriptor = device->getDeviceDescriptor();
     if (deviceDescriptor && deviceDescriptor->idVendor == VENDOR_USB_INTEL) {
+        ibtpRegisterSysctl(); // late: BSD sysctl is ready once USB enumerates
+        device->setProperty("ibtp-filter", avrcpPlayingFilter);
         uint8_t epType = StandardUSB::getEndpointType(descriptor);
         if (epType == kIOUSBEndpointTypeInterrupt)
             CIntelBTPatcher::_hookPipeInstance = that;
         else if (epType == kIOUSBEndpointTypeBulk &&
                  StandardUSB::getEndpointDirection(descriptor) == kIOUSBEndpointDirectionOut) {
             btBulkOutPipe = that;
+            ibtpPipe++;
             if (avrcpPlayingFilter)
                 SYSLOG(DRV_NAME, "captured BT bulk-out pipe (ep 0x%02x)", descriptor->bEndpointAddress);
         }
