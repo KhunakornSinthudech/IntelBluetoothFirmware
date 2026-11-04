@@ -1,3 +1,11 @@
+# Fix Airpods disconnection on playing music.
+
+This fork is aim to fix the AirPods disconnection while playing music file or Apple Music on **AX210**.
+The PackageLogger shows **Exit Sniff Mode → Command Disallowed** then Mac send the music stream to the AirPods by ignore this packet event.
+
+This fork will disable the sniff command with a trade off for battery life.
+
+_______________________________________
 # IntelBluetoothFirmware
 
 ![CI](https://github.com/OpenIntelWireless/IntelBluetoothFirmware/workflows/CI/badge.svg)
