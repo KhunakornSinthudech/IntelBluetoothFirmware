@@ -10,6 +10,7 @@
 #include <Headers/plugin_start.hpp>
 
 #include "IntelBTPatcher.hpp"
+#include <IOKit/IOBufferMemoryDescriptor.h>
 
 static CIntelBTPatcher ibtPatcher;
 static CIntelBTPatcher *callbackIBTPatcher = nullptr;
@@ -69,12 +70,14 @@ static KernelPatcher::KextInfo IntelBTPatcher_IOUsbHostInfo {
 void *CIntelBTPatcher::_hookPipeInstance = nullptr;
 bool CIntelBTPatcher::_randomAddressInit = false;
 
-static bool avrcpPlayingFilter = true;
+static bool avrcpPlayingFilter = false;
 
 bool CIntelBTPatcher::init()
 {
-    if (checkKernelArgument("-ibtallowplaying"))
-        avrcpPlayingFilter = false;
+    if (checkKernelArgument("-ibtnoplaying")) {
+        avrcpPlayingFilter = true;
+        SYSLOG(DRV_NAME, "AVRCP PLAYING filter enabled");
+    }
     DBGLOG(DRV_NAME, "%s", __PRETTY_FUNCTION__);
     callbackIBTPatcher = this;
     if (getKernelVersion() < KernelVersion::Monterey) {
@@ -331,17 +334,28 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
 // PlaybackStatus = PLAYING on this (non-Apple) controller. Rewrite outgoing
 // AVRCP RegisterNotification(PLAYBACK_STATUS_CHANGED) and GetPlayStatus
 // responses so PLAYING (0x01) is reported as PAUSED (0x02).
-// Disable with boot-arg -ibtallowplaying.
+//
+// Opt-in: only active with boot-arg -ibtnoplaying.
+// Safety: only touches the Intel BT bulk-OUT pipe, and only buffers that are
+// IOBufferMemoryDescriptor (wired kernel memory, accessed by pointer, no
+// readBytes/copypv in the submit path).
+static void *btBulkOutPipe = nullptr;
 static uint32_t avrcpRewriteCount = 0;
+static bool loggedBufClass = false;
 
-static void filterAvrcpPlaying(IOMemoryDescriptor *buf, uint32_t len)
+static void filterAvrcpPlaying(void *pipe, IOMemoryDescriptor *buf, uint32_t len)
 {
-    if (!avrcpPlayingFilter || !buf || len < 23 || len > 64)
+    if (!avrcpPlayingFilter || pipe != btBulkOutPipe || !buf)
         return;
-    if (buf->getDirection() != kIODirectionOut)
+    IOBufferMemoryDescriptor *bmd = OSDynamicCast(IOBufferMemoryDescriptor, buf);
+    if (!loggedBufClass) {
+        loggedBufClass = true;
+        SYSLOG(DRV_NAME, "BT bulk-out buffer class: %s", buf->getMetaClass()->getClassName());
+    }
+    if (!bmd || len < 23 || len > 64 || bmd->getLength() < len)
         return;
-    uint8_t p[64];
-    if (buf->readBytes(0, p, len) != len)
+    uint8_t *p = (uint8_t *)bmd->getBytesNoCopy();
+    if (!p)
         return;
     uint16_t aclLen = p[2] | (p[3] << 8);
     uint16_t l2Len  = p[4] | (p[5] << 8);
@@ -358,13 +372,12 @@ static void filterAvrcpPlaying(IOMemoryDescriptor *buf, uint32_t len)
     if (pdu == 0x31 && (ctype == 0x0d || ctype == 0x0f) && len == 23 &&
         a[11] == 0x00 && a[12] == 0x02 && a[13] == 0x01)
         off = 8 + 14;                       // event PLAYBACK_STATUS_CHANGED, status byte
-    else if (pdu == 0x30 && ctype == 0x0c && len == 8 + 13 + 9 &&
+    else if (pdu == 0x30 && ctype == 0x0c && len == 8 + 22 &&
              a[11] == 0x00 && a[12] == 0x09)
-        off = 8 + 13 + 8;                   // GetPlayStatus: len(4) pos(4) status(1)
+        off = 8 + 21;                       // GetPlayStatus: len(4) pos(4) status(1)
     if (!off || p[off] != 0x01)
         return;
-    uint8_t paused = 0x02;
-    buf->writeBytes(off, &paused, 1);
+    p[off] = 0x02;
     if (avrcpRewriteCount++ < 20)
         SYSLOG(DRV_NAME, "AVRCP PlayStatus PLAYING -> PAUSED (pdu 0x%02x)", pdu);
 }
@@ -372,7 +385,7 @@ static void filterAvrcpPlaying(IOMemoryDescriptor *buf, uint32_t len)
 IOReturn CIntelBTPatcher::
 newAsyncIO(void *that, IOMemoryDescriptor* dataBuffer, uint32_t bytesTransferred, IOUSBHostCompletion* completion, uint32_t completionTimeoutMs)
 {
-    filterAvrcpPlaying(dataBuffer, bytesTransferred);
+    filterAvrcpPlaying(that, dataBuffer, bytesTransferred);
     if (remoteReadSCount > 0 && that == _hookPipeInstance && completion) {
         AsyncOwnerData *ownerData = new AsyncOwnerData;
         ownerData->action = completion->action;
@@ -395,6 +408,12 @@ void CIntelBTPatcher::captureIntelInterruptPipe(void *that, StandardUSB::Endpoin
         uint8_t epType = StandardUSB::getEndpointType(descriptor);
         if (epType == kIOUSBEndpointTypeInterrupt)
             CIntelBTPatcher::_hookPipeInstance = that;
+        else if (epType == kIOUSBEndpointTypeBulk &&
+                 StandardUSB::getEndpointDirection(descriptor) == kIOUSBEndpointDirectionOut) {
+            btBulkOutPipe = that;
+            if (avrcpPlayingFilter)
+                SYSLOG(DRV_NAME, "captured BT bulk-out pipe (ep 0x%02x)", descriptor->bEndpointAddress);
+        }
     }
 }
 
