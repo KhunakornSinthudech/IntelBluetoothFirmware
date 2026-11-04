@@ -75,7 +75,8 @@ static bool avrcpPlayingFilter = false;
 
 // Counters readable with: sysctl debug.ibtp
 static uint32_t ibtpFilterOn = 0, ibtpPipe = 0, ibtpCalls = 0, ibtpBmd = 0,
-                ibtpOther = 0, ibtpMatch = 0, ibtpRewrite = 0;
+                ibtpOther = 0, ibtpMatch = 0, ibtpRewrite = 0, ibtpSkipIntr = 0;
+static char ibtpClass[64] = "";
 SYSCTL_NODE(_debug, OID_AUTO, ibtp, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "IntelBTPatcher");
 SYSCTL_UINT(_debug_ibtp, OID_AUTO, filter,  CTLFLAG_RD | CTLFLAG_LOCKED, &ibtpFilterOn, 0, "");
 SYSCTL_UINT(_debug_ibtp, OID_AUTO, pipe,    CTLFLAG_RD | CTLFLAG_LOCKED, &ibtpPipe, 0, "");
@@ -84,6 +85,8 @@ SYSCTL_UINT(_debug_ibtp, OID_AUTO, bmd,     CTLFLAG_RD | CTLFLAG_LOCKED, &ibtpBm
 SYSCTL_UINT(_debug_ibtp, OID_AUTO, other,   CTLFLAG_RD | CTLFLAG_LOCKED, &ibtpOther, 0, "");
 SYSCTL_UINT(_debug_ibtp, OID_AUTO, match,   CTLFLAG_RD | CTLFLAG_LOCKED, &ibtpMatch, 0, "");
 SYSCTL_UINT(_debug_ibtp, OID_AUTO, rewrite, CTLFLAG_RD | CTLFLAG_LOCKED, &ibtpRewrite, 0, "");
+SYSCTL_UINT(_debug_ibtp, OID_AUTO, skipintr, CTLFLAG_RD | CTLFLAG_LOCKED, &ibtpSkipIntr, 0, "");
+SYSCTL_STRING(_debug_ibtp, OID_AUTO, bufclass, CTLFLAG_RD | CTLFLAG_LOCKED, ibtpClass, sizeof(ibtpClass), "");
 
 static bool ibtpSysctlDone = false;
 static void ibtpRegisterSysctl()
@@ -99,6 +102,8 @@ static void ibtpRegisterSysctl()
     sysctl_register_oid(&sysctl__debug_ibtp_other);
     sysctl_register_oid(&sysctl__debug_ibtp_match);
     sysctl_register_oid(&sysctl__debug_ibtp_rewrite);
+    sysctl_register_oid(&sysctl__debug_ibtp_skipintr);
+    sysctl_register_oid(&sysctl__debug_ibtp_bufclass);
 }
 
 bool CIntelBTPatcher::init()
@@ -370,52 +375,86 @@ static void asyncIOCompletion(void* owner, void* parameter, IOReturn status, uin
 // IOBufferMemoryDescriptor (wired kernel memory, accessed by pointer, no
 // readBytes/copypv in the submit path).
 static void *btBulkOutPipe = nullptr;
-static uint32_t avrcpRewriteCount = 0;
 static bool loggedBufClass = false;
+
+extern "C" boolean_t ml_get_interrupts_enabled(void);
+
+// Returns offset of the PlayStatus byte if p[0..len) is an AVRCP
+// PlaybackStatus response we care about, else 0.
+static uint32_t avrcpStatusOffset(const uint8_t *p, uint32_t len)
+{
+    uint16_t aclLen = p[2] | (p[3] << 8);
+    uint16_t l2Len  = p[4] | (p[5] << 8);
+    if (aclLen + 4 != len || l2Len + 8 != len)
+        return 0;
+    const uint8_t *a = p + 8; // AVCTP header
+    if ((a[0] & 0x03) != 0x02 || a[1] != 0x11 || a[2] != 0x0e) // response, AV/C remote PID
+        return 0;
+    // AV/C: ctype, subunit 0x48 (panel), opcode 0x00 (vendor dep.), BT SIG company 00 19 58
+    if (a[4] != 0x48 || a[5] != 0x00 || a[6] != 0x00 || a[7] != 0x19 || a[8] != 0x58)
+        return 0;
+    uint8_t ctype = a[3], pdu = a[9];
+    if (pdu == 0x31 && (ctype == 0x0d || ctype == 0x0f) && len == 23 &&
+        a[11] == 0x00 && a[12] == 0x02 && a[13] == 0x01)
+        return 8 + 14;                      // event PLAYBACK_STATUS_CHANGED, status byte
+    if (pdu == 0x30 && ctype == 0x0c && len == 8 + 22 &&
+        a[11] == 0x00 && a[12] == 0x09)
+        return 8 + 21;                      // GetPlayStatus: len(4) pos(4) status(1)
+    return 0;
+}
 
 static void filterAvrcpPlaying(void *pipe, IOMemoryDescriptor *buf, uint32_t len)
 {
     if (!avrcpPlayingFilter || pipe != btBulkOutPipe || !buf)
         return;
     ibtpCalls++;
-    IOBufferMemoryDescriptor *bmd = OSDynamicCast(IOBufferMemoryDescriptor, buf);
-    if (bmd) ibtpBmd++; else ibtpOther++;
     if (!loggedBufClass) {
         loggedBufClass = true;
-        SYSLOG(DRV_NAME, "BT bulk-out buffer class: %s", buf->getMetaClass()->getClassName());
+        strlcpy(ibtpClass, buf->getMetaClass()->getClassName(), sizeof(ibtpClass));
     }
-    if (!bmd || len < 23 || len > 64 || bmd->getLength() < len)
+    if (len < 23 || len > 64 || buf->getLength() < len)
         return;
-    uint8_t *p = (uint8_t *)bmd->getBytesNoCopy();
-    if (!p)
+
+    IOBufferMemoryDescriptor *bmd = OSDynamicCast(IOBufferMemoryDescriptor, buf);
+    if (bmd) {
+        ibtpBmd++;
+        uint8_t *p = (uint8_t *)bmd->getBytesNoCopy();
+        if (!p)
+            return;
+        uint32_t off = avrcpStatusOffset(p, len);
+        if (!off)
+            return;
+        ibtpMatch++;
+        if (p[off] == 0x01) {
+            p[off] = 0x02;
+            ibtpRewrite++;
+        }
         return;
-    uint16_t aclLen = p[2] | (p[3] << 8);
-    uint16_t l2Len  = p[4] | (p[5] << 8);
-    if (aclLen + 4 != len || l2Len + 8 != len)
+    }
+
+    // Generic descriptor (e.g. memory owned by bluetoothd). Only touch it from
+    // thread context with interrupts on, and wire it ourselves first so the
+    // copy cannot fault.
+    ibtpOther++;
+    if (!ml_get_interrupts_enabled()) {
+        ibtpSkipIntr++;
         return;
-    const uint8_t *a = p + 8; // AVCTP header
-    if ((a[0] & 0x03) != 0x02 || a[1] != 0x11 || a[2] != 0x0e) // response, AV/C remote PID
+    }
+    if (buf->prepare() != kIOReturnSuccess)
         return;
-    // AV/C: ctype, subunit 0x48 (panel), opcode 0x00 (vendor dep.), BT SIG company 00 19 58
-    if (a[4] != 0x48 || a[5] != 0x00 || a[6] != 0x00 || a[7] != 0x19 || a[8] != 0x58)
-        return;
-    uint8_t ctype = a[3], pdu = a[9];
-    uint32_t off = 0;
-    if (pdu == 0x31 && (ctype == 0x0d || ctype == 0x0f) && len == 23 &&
-        a[11] == 0x00 && a[12] == 0x02 && a[13] == 0x01)
-        off = 8 + 14;                       // event PLAYBACK_STATUS_CHANGED, status byte
-    else if (pdu == 0x30 && ctype == 0x0c && len == 8 + 22 &&
-             a[11] == 0x00 && a[12] == 0x09)
-        off = 8 + 21;                       // GetPlayStatus: len(4) pos(4) status(1)
-    if (!off)
-        return;
-    ibtpMatch++;
-    if (p[off] != 0x01)
-        return;
-    p[off] = 0x02;
-    ibtpRewrite++;
-    if (avrcpRewriteCount++ < 20)
-        SYSLOG(DRV_NAME, "AVRCP PlayStatus PLAYING -> PAUSED (pdu 0x%02x)", pdu);
+    uint8_t p[64];
+    if (buf->readBytes(0, p, len) == len) {
+        uint32_t off = avrcpStatusOffset(p, len);
+        if (off) {
+            ibtpMatch++;
+            if (p[off] == 0x01) {
+                uint8_t paused = 0x02;
+                if (buf->writeBytes(off, &paused, 1) == 1)
+                    ibtpRewrite++;
+            }
+        }
+    }
+    buf->complete();
 }
 
 IOReturn CIntelBTPatcher::
